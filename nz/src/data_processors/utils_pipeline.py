@@ -7,6 +7,8 @@ import json
 
 from multiprocessing import Process, Queue, Event, Manager
 
+from nz.src.data_processors.region_map import REGION_MAP
+
 
 from scipy.spatial import cKDTree
 
@@ -24,6 +26,60 @@ def chk_conn(conn):
     except Exception as ex:
         return False
 
+def clean_region_name(name):
+    if pd.isna(name):
+        return ''
+    return (
+        str(name)
+        .strip()
+        .rstrip(';')
+        .strip()
+        .replace('\u2019', '')
+        .replace('\u2018', '')
+        .replace("'", '')
+    )
+
+def apply_region_map(df, col='REGION'):
+    df = df.copy()
+    df[col] = df[col].apply(clean_region_name)
+    df['script_region'] = df[col].map(REGION_MAP)
+    unmapped = df[df['script_region'].isna()][col].unique()
+    if len(unmapped):
+        print(f"[WARNING] Régions non mappées : {unmapped}")
+    return df
+
+def get_holiday_dates(df_holiday, region):
+    df = df_holiday[df_holiday['script_region'].isin([region, 'all'])].copy()
+
+    holiday_dates = set()
+    for _, row in df.iterrows():
+        date_range = pd.date_range(start=row['START_DATE'], end=row['STOP_DATE'], freq='D')
+        holiday_dates.update(d.date() for d in date_range)
+
+    return holiday_dates
+
+def get_hours_since_xtw(chunk_datetime_utc, df_xtw, region, max_days=14):
+
+    df = df_xtw[df_xtw['script_region'].isin([region, 'all'])].copy()
+
+    max_hours = max_days * 24
+
+    if df.empty:
+        return pd.Series(max_hours, index=chunk_datetime_utc.index)
+
+    event_times = pd.to_datetime(df['START_DATE']).dt.tz_localize(None).sort_values().values
+
+    def hours_since(dt):
+        past = event_times[event_times <= dt]
+        if len(past) == 0:
+            return max_hours
+        most_recent = past[-1]
+        delta = (dt - most_recent) / np.timedelta64(1, 'h')
+        return int(delta) if delta <= max_hours else max_hours
+
+
+    return chunk_datetime_utc.apply(hours_since)
+
 
 def mount_worker(worker_id, tasks, db_path, db_path_era5, chunksize, output_queue, stop_event, progress_dict):
     if isinstance(chunksize, str):
@@ -36,17 +92,35 @@ def mount_worker(worker_id, tasks, db_path, db_path_era5, chunksize, output_queu
             grid_coords = weather_grid[['longitude', 'latitude']].values
             tree = cKDTree(grid_coords)
 
+        df_holiday = pd.read_sql("SELECT * FROM holiday", conn)
+
+        df_holiday['START_DATE'] = pd.to_datetime(df_holiday['START_DATE']).dt.normalize()
+        df_holiday['STOP_DATE'] = pd.to_datetime(df_holiday['STOP_DATE']).dt.normalize()
+        df_holiday = apply_region_map(df_holiday)
+
+        df_xtw = pd.read_sql("SELECT * FROM extreme_weather", conn)
+        df_xtw['START_DATE'] = pd.to_datetime(df_xtw['START_DATE']).dt.normalize()
+        df_xtw = apply_region_map(df_xtw)
+
         try:
             for region, stations_df in tasks:
                 if stop_event.is_set():
                     break
 
                 try:
+
+                    region = region.split(" - ")[-1]
+                    print("flag3")
+
+                    print("region" , region)
+
+
+
                     u_siteref_list = stations_df['SITEREF'].unique().tolist()
 
 
                     for siteref in u_siteref_list:
-                        print(siteref)
+
 
                         #placeholders = ','.join(['?'] * len(u_siteref_list))
                         query = f"SELECT * FROM flow WHERE SITEREF = ? ORDER BY DATETIME"
@@ -67,9 +141,9 @@ def mount_worker(worker_id, tasks, db_path, db_path_era5, chunksize, output_queu
 
 
 
-                            chunk = chunk[chunk['DATETIME'] >= '2013-01-02']
-                            if chunk.empty:
-                                continue
+                        #    chunk = chunk[chunk['DATETIME'] >= '2013-01-02']
+                        #    if chunk.empty:
+                        #        continue
 
                             chunk = chunk.merge(stations_df[['SITEREF', 'LON', 'LAT']], on='SITEREF', how='left')
 
@@ -129,7 +203,6 @@ def mount_worker(worker_id, tasks, db_path, db_path_era5, chunksize, output_queu
                                     how='left'
                                 )
 
-
                                 nan_report = chunk.isna().sum()
                                 if nan_report.any():
                                     print(f"\n{'='*80}")
@@ -145,6 +218,29 @@ def mount_worker(worker_id, tasks, db_path, db_path_era5, chunksize, output_queu
                                 chunk = chunk.drop(columns=drop_cols)
                             else:
                                 print(f"[Worker {worker_id}] No weather data for chunk {chunk_idx} in {region}")
+
+
+                            holiday_dates = get_holiday_dates(df_holiday, region)
+
+                            chunk['date_only']  = (
+                                chunk['DATETIME_NZ']
+                                .dt.normalize()
+                                .dt.tz_localize(None)
+                                .dt.date
+                            )
+                            chunk['is_holiday'] = chunk['date_only'].isin(holiday_dates).astype(int)
+                            chunk = chunk.drop(columns=['date_only'])
+
+                        # ---
+                            chunk['hours_since_xtw'] = get_hours_since_xtw(
+                                chunk['time_in_utc'],
+                                df_xtw,
+                                region
+                            )
+
+                            chunk['days_since_xtw'] = (chunk['hours_since_xtw'] / 24).round(2)
+
+
 
                             output_queue.put({
                                 'worker_id': worker_id,
@@ -168,10 +264,10 @@ def mount_worker(worker_id, tasks, db_path, db_path_era5, chunksize, output_queu
 def mount_consumer(consumer_id, input_queue, stop_event, process_func, progress_dict):
 
     cols_to_keep = [
-        'SITEREF', 'DATETIME', 'FLOW', 'WEIGHT', 'DIRECTION',
-        'LON', 'LAT', 'DATETIME_NZ',
-        'era5_lon', 'era5_lat',
-        'msl', 'tcc', 'u10', 'v10', 't2m', 'd2m', 'tp', 'cp', 'ssrd'
+        'SITEREF', 'DATETIME', 'FLOW', 'WEIGHT', 'DIRECTION', 'LON', 'LAT',
+         'DATETIME_NZ', 'era5_lon', 'era5_lat', 'msl', 'tcc', 'u10', 'v10',
+         't2m', 'd2m', 'tp', 'cp', 'ssrd', 'is_holiday', 'hours_since_xtw',
+         'days_since_xtw'
     ]
 
     processed_count = 0
@@ -192,6 +288,8 @@ def mount_consumer(consumer_id, input_queue, stop_event, process_func, progress_
 
                # if process_func:
                 #    process_func(chunk)
+
+          #      print('col:', chunk.columns)
 
                 chunk.to_sql(
                     'data',

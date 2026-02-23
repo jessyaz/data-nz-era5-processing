@@ -95,6 +95,7 @@ def run(db_paths : dict, orchestrator_params : dict) -> None:
             tasks.append((region, stations_df))
 
     print(f"Total tasks: {len(tasks)}")
+   # print("base region :" ,unique_regions)
 
     parallel_orchestrator(
         db_path=Path(db_paths['nzdb']),
