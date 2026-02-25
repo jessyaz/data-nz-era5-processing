@@ -24,11 +24,11 @@ def run():
         return x#
 
     orchestrator_params = {
-        'chunk_size': 10_000,
-        'n_producers':8,
+        'chunk_size': 500_000,
+        'n_producers':14,
         'n_consumers':1,
         'process_func': None, # Callable
-        'queue_maxsize': 10
+        'queue_maxsize': 50
     }
     run_processing.run(db_paths, orchestrator_params)
 

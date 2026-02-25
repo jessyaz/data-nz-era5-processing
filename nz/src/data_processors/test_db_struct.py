@@ -59,9 +59,10 @@ class NZStruct():
             try:
                 query = "SELECT DISTINCT SITEREF, LON, LAT FROM flow_meta WHERE REGION = ?"
                 df = pd.read_sql(query, conn, params=(region,))
+              #  print(df)
                 return df
             except Exception as e:
-                print(f"Error fetching siterefs: {e}")
+                print(f"Fatal Error fetching siterefs: {e}")
                 return pd.DataFrame(columns=['SITEREF', 'LON', 'LAT'])
 
 

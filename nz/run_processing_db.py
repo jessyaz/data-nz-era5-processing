@@ -7,7 +7,7 @@ from pathlib import Path
 
 from nz.src.data_processors.utils_pipeline import mount_worker, mount_consumer, progress_monitor
 
-
+import sys
 import os
 
 
@@ -89,13 +89,22 @@ def run(db_paths : dict, orchestrator_params : dict) -> None:
     unique_regions = metadata['flow_region']['region'].unique().tolist()
 
     tasks = []
+
     for region in unique_regions:
         stations_df = db_instance.getSiterefFromRegion(region)
-        if not stations_df.empty:
-            tasks.append((region, stations_df))
 
+        if not stations_df.empty:
+            for index, row in stations_df.iterrows():
+                tasks.append((
+                    region,
+                    row['SITEREF'],
+                    row['LON'],
+                    row['LAT']
+                ))
+
+    #print(tasks)
     print(f"Total tasks: {len(tasks)}")
-   # print("base region :" ,unique_regions)
+    #sys.exit(-1)
 
     parallel_orchestrator(
         db_path=Path(db_paths['nzdb']),
