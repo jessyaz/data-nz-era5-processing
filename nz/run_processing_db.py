@@ -5,11 +5,10 @@ from typing import List, Tuple, Callable
 import nz.src.data_processors.test_db_struct as DBStruct
 from pathlib import Path
 
-from nz.src.data_processors.utils_pipeline import mount_worker, mount_consumer, progress_monitor
+from nz.src.data_processors.utils_pipeline import mount_worker, mount_consumer, prog_mon
 
 import sys
 import os
-
 
 def parallel_orchestrator(db_path: str, db_path_era5: str, tasks: List[Tuple], chunksize: int, n_producers: int, n_consumers: int, process_func: Callable, queue_maxsize: int, total_tasks : int):
 
@@ -17,8 +16,9 @@ def parallel_orchestrator(db_path: str, db_path_era5: str, tasks: List[Tuple], c
     manager = ctx.Manager()
 
     progress_dict = manager.dict()
-    progress_dict['total_chunks_produced'] = 0
-    progress_dict['total_chunks_processed'] = 0
+    progress_dict['t_prod'] = 0
+    progress_dict['t_proc'] = 0
+    progress_dict['t_done'] = 0
 
     data_queue = ctx.Queue(maxsize=queue_maxsize)
     stop_event = ctx.Event()
@@ -35,11 +35,11 @@ def parallel_orchestrator(db_path: str, db_path_era5: str, tasks: List[Tuple], c
 
     producers = []
     for i in range(n_producers):
-        p = ctx.Process(target=mount_worker, args=(i, producer_tasks[i], db_path, db_path_era5,chunksize, data_queue, stop_event, progress_dict))
+        p = ctx.Process(target=mount_worker, args=(i, producer_tasks[i], db_path, db_path_era5, chunksize, data_queue, stop_event, progress_dict))
         p.start()
         producers.append(p)
 
-    monitor_thread = ctx.Process(target=progress_monitor, args=(progress_dict, stop_event, n_producers, n_consumers, total_tasks))
+    monitor_thread = ctx.Process(target=prog_mon, args=(progress_dict, stop_event, n_producers, n_consumers, total_tasks))
     monitor_thread.start()
 
     try:
@@ -74,14 +74,10 @@ def run(db_paths : dict, orchestrator_params : dict) -> None:
 
     print("Launch from : ", os.listdir())
 
-    #db_file = Path(db_paths['nzdb'])
-    #db_era5_folder = Path(db_paths['era5db'])
-
     test_result = DBStruct.test_dbs_struct()
     if test_result:
         print("Error while checking database structure : Structure does'nt math or db does'nt exist at path.")
         sys.exit(-1)
-
 
     db_instance = DBStruct.NZStruct(db_paths['nzdb'])
     metadata = db_instance.getMetadata()
@@ -102,21 +98,19 @@ def run(db_paths : dict, orchestrator_params : dict) -> None:
                     row['LAT']
                 ))
 
-    #print(tasks)
     print(f"Total tasks: {len(tasks)}")
-    #sys.exit(-1)
 
     parallel_orchestrator(
         db_path=Path(db_paths['nzdb']),
         db_path_era5=Path(db_paths['era5db']),
         tasks=tasks,
-        chunksize=int(str(orchestrator_params['chunk_size']).replace("_", "")), # Sécurité si str
+        chunksize=int(str(orchestrator_params['chunk_size']).replace("_", "")),
         n_producers=int(orchestrator_params['n_producers']),
         n_consumers=int(orchestrator_params['n_consumers']),
         process_func=orchestrator_params['process_func'],
-        queue_maxsize=int(orchestrator_params['queue_maxsize']), # Conversion ici
+        queue_maxsize=int(orchestrator_params['queue_maxsize']),
         total_tasks=len(tasks)
     )
 
 if __name__ == "__main__":
-    run()
+    pass

@@ -24,8 +24,8 @@ def run():
         return x#
 
     orchestrator_params = {
-        'chunk_size': 500_000,
-        'n_producers':14,
+        'chunk_size': 10_000,
+        'n_producers':16,
         'n_consumers':1,
         'process_func': None, # Callable
         'queue_maxsize': 50

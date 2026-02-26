@@ -26,7 +26,7 @@ print(unique_sites.head())
 print("Starting timer")
 start_time = time.time()
 
-# Tirer 5 SITEREF aléatoires
+
 sample_sites = random.sample(unique_sites, 1)
 
 with sqlite3.connect(db_raw_path) as conn:

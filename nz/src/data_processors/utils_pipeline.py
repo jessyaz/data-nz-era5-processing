@@ -1,385 +1,273 @@
 import sqlite3
+from logging.config import IDENTIFIER
+
 import pandas as pd
 import time
 from queue import Empty
 from tqdm import tqdm
 import json
-
 from multiprocessing import Process, Queue, Event, Manager
-
-from nz.src.data_processors.region_map import REGION_MAP
-
-
 from scipy.spatial import cKDTree
-
 import numpy as np
-
-
 import pytz
 from pathlib import Path
+from nz.src.data_processors.region_map import REGION_MAP
 
-
-def chk_conn(conn):
+def chk_con(c):
     try:
-        conn.cursor()
-        return True
-    except Exception as ex:
+        return bool(c.cursor())
+    except Exception:
         return False
 
-def clean_region_name(name):
-    print("test")
-    if pd.isna(name):
-        return ''
-    return (
-        str(name)
-        .strip()
-        .rstrip(';')
-        .strip()
-        .replace('\u2019', '')
-        .replace('\u2018', '')
-        .replace("'", '')
-    )
-
-def apply_region_map(df, col='REGION'):
-    df[col] = df[col].astype(str).str.strip().str.rstrip(';').str.replace(r"['\u2019\u2018]", "", regex=True)
-    df['script_region'] = df[col].map(REGION_MAP)
+def map_reg(df, col='REGION'):
+    df[col] = df[col].astype(str).str.split(" - ").str[-1].str.strip().str.rstrip(';').str.replace(r"['\u2019\u2018]", "", regex=True)
+    df['r_code'] = df[col].map(REGION_MAP)
     return df
 
-def get_holiday_data(chunk, df_holiday, region):
+#def get_hol(df, df_h, reg):
+#    df_s = df_h[df_h['r_code'].isin([reg, 'all'])].drop_duplicates(subset=['START_DATE'])
+#    df = df.assign(j_dt=df['DATETIME_NZ'].dt.date).merge(
+#        df_s.assign(j_dt=df_s['START_DATE'].dt.date), on='j_dt', how='left'
+#    )
+#    df['is_holiday'] = df['START_DATE'].notna().astype(int)
+#    return df.drop(columns=['j_dt'])
 
-    df_h = df_holiday[df_holiday['script_region'].isin([region, 'all'])].copy()
+def get_hol(df, df_h, reg):
+    df['IS_HOLIDAY'] = False
+    holidays = df_h[df_h['r_code'].isin([reg, 'all'])]
+    for _, row in holidays.iterrows():
+        mask = df['DATETIME'].between(row['START_DATE'], row['STOP_DATE'])
+        df.loc[mask, 'IS_HOLIDAY'] = True
+    return df
 
-    chunk['join_date'] = chunk['DATETIME_NZ'].dt.date
-    df_h['join_date'] = df_h['START_DATE'].dt.date
+def get_xtw(df, df_x, reg):
+    max_hours = 336  #14 jours * 24 heures
 
-    df_h = df_h.drop_duplicates(subset=['join_date'])
-    chunk = chunk.merge(df_h, on='join_date', how='left')
+    df_s = df_x[df_x['r_code'].isin([reg, 'all'])].copy()
+    df['DATETIME'] = pd.to_datetime(df['DATETIME']).astype('datetime64[s]')
+    df_s['START_DATE'] = pd.to_datetime(df_s['START_DATE']).astype('datetime64[s]')
 
-    chunk['is_holiday'] = chunk['START_DATE'].notna().astype(int)
-    return chunk.drop(columns=['join_date'])
-
-def get_xtw_data(chunk, df_xtw, region):
-    df_x = df_xtw[df_xtw['script_region'].isin([region, 'all'])].copy()
-    if df_x.empty:
-        return chunk
-
-    chunk['time_in_utc'] = pd.to_datetime(chunk['time_in_utc']).astype('datetime64[s]')
-    df_x['START_DATE'] = pd.to_datetime(df_x['START_DATE']).astype('datetime64[s]')
-
-    chunk = chunk.sort_values('time_in_utc')
-    df_x = df_x.sort_values('START_DATE')
-
-    chunk = pd.merge_asof(
-        chunk, df_x,
-        left_on='time_in_utc',
+    df = pd.merge_asof(
+        df.sort_values('DATETIME'),
+        df_s[['START_DATE','HAZARD','IDENTIFIER','ABSTRACT','IMPACT']].drop_duplicates().sort_values('START_DATE'),
+        left_on='DATETIME',
         right_on='START_DATE',
-        direction='backward',
-        suffixes=('', '_xtw')
+        direction='backward'
     )
 
-    delta = (chunk['time_in_utc'] - chunk['START_DATE_xtw']).dt.total_seconds() / 3600
-    chunk['hours_since_xtw'] = delta.fillna(336).clip(upper=336)
-    chunk['days_since_xtw'] = (chunk['hours_since_xtw'] / 24).round(2)
+    df['H_SINCE_XTW'] = (
+            (df['DATETIME'] - df['START_DATE'])
+            .dt.total_seconds() / 3600
+    ).clip(lower=0, upper=max_hours).fillna(max_hours).astype(int)
 
-    return chunk
 
+    return df
 
-def mount_worker(worker_id, tasks, db_path, db_path_era5, chunksize, output_queue, stop_event, progress_dict):
-    if isinstance(chunksize, str):
-        chunksize = int(chunksize.replace("_", ""))
+def init_db(c):
+    c.execute("CREATE TABLE IF NOT EXISTS catalog (col TEXT NOT NULL, code INTEGER NOT NULL, label TEXT NOT NULL, PRIMARY KEY (col, label))")
+    c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_cat ON catalog(col, code)")
+    c.execute("CREATE TABLE IF NOT EXISTS site_info (region TEXT, siteref TEXT, min_date TEXT, max_date TEXT, PRIMARY KEY (region, siteref))")
+    c.commit()
 
-    with sqlite3.connect(db_path) as conn, sqlite3.connect(db_path_era5) as conn_era5:
+def upd_site(c, df):
+
+    for _, row in df.iterrows():
+        c.execute("""
+                  INSERT INTO site_info (region, siteref, min_date, max_date)
+                  VALUES (?, ?, ?, ?)
+                      ON CONFLICT(region, siteref) DO UPDATE SET
+                      min_date = MIN(site_info.min_date, excluded.min_date),
+                                                          max_date = MAX(site_info.max_date, excluded.max_date)
+                  """, (str(row['REGION']), str(row['SITEREF']), str(row['DATETIME_MIN']), str(row['DATETIME_MAX'])))
+    c.commit()
+
+def enc_db(c, df, cols):
+    for col in cols:
+
+        u_val = df[col].astype(str).unique()
+        rows = c.execute("SELECT label, code FROM catalog WHERE col = ?", (col,)).fetchall()
+        d_map = {r[0]: r[1] for r in rows}
+
+        n_ent = []
+        c_max = max(d_map.values()) if d_map else -1
+
+        for v in u_val:
+            if v not in d_map:
+                c_max += 1
+                d_map[v] = c_max
+                n_ent.append((col, c_max, v))
+
+        if n_ent:
+            c.executemany("INSERT OR IGNORE INTO catalog (col, code, label) VALUES (?, ?, ?)", n_ent)
+            c.commit()
+
+        df[col] = df[col].astype(str).map(d_map).astype('int32')
+
+    return df
+
+def mount_worker(w_id, tasks, db_in, db_era, b_size, q_out, stop, prog):
+    b_size = int(str(b_size).replace("_", ""))
+
+    with sqlite3.connect(db_in) as c_in, sqlite3.connect(db_era) as c_era:
         with open('./nz/data/raw/era5_downloads/weather_grid.json', "r", encoding="utf-8") as f:
-            weather_grid = pd.DataFrame(json.load(f))
-            grid_coords = weather_grid[['longitude', 'latitude']].values
-            tree = cKDTree(grid_coords)
+            grid = pd.DataFrame(json.load(f))[['longitude', 'latitude']].values
+            tree = cKDTree(grid)
 
-        df_holiday = pd.read_sql("SELECT * FROM holiday", conn)
-        df_holiday['START_DATE'] = pd.to_datetime(df_holiday['START_DATE']).dt.normalize()
-        df_holiday['STOP_DATE'] = pd.to_datetime(df_holiday['STOP_DATE']).dt.normalize()
-        df_holiday = apply_region_map(df_holiday)
+        df_h = map_reg(pd.read_sql("SELECT * FROM holiday", c_in).assign(
+            START_DATE=lambda x: pd.to_datetime(x['START_DATE']).dt.normalize(),
+            STOP_DATE=lambda x: pd.to_datetime(x['STOP_DATE']).dt.normalize()
+        ))
 
-        df_xtw = pd.read_sql("SELECT * FROM extreme_weather", conn)
-        df_xtw['START_DATE'] = pd.to_datetime(df_xtw['START_DATE']).dt.normalize()
-        df_xtw = apply_region_map(df_xtw)
+        df_x = map_reg(pd.read_sql("SELECT * FROM extreme_weather", c_in).assign(
+            START_DATE=lambda x: pd.to_datetime(x['START_DATE']).dt.normalize()
+        ))
 
         try:
-            for region, station, lon, lat in tasks:
-                if stop_event.is_set():
+            for reg, site, lon, lat in tasks:
+                if stop.is_set():
                     break
 
-                #print("aaa", region, station, lon, lat)
                 try:
-                    region = region.split(" - ")[-1]
+                    reg = map_reg(pd.DataFrame({'REGION': [reg]}) )['REGION'].iloc[0]   # MAP REG DIRECT
 
-                    #for siteref in u_siteref_list:
+                    bnd = pd.read_sql("SELECT MIN(DATETIME) as m_dt, MAX(DATETIME) as mx_dt FROM flow WHERE SITEREF = ? AND DATETIME >= '2013-01-02'", c_in, params=[site])
+                    if bnd.empty or pd.isna(bnd['m_dt'].iloc[0]):
+                        continue
 
-                   # print("station['SITEREF'].values" , station['SITEREF'].values)
+                    df = pd.read_sql("SELECT * FROM flow WHERE SITEREF = ? AND DATETIME >= '2013-01-02' ORDER BY DATETIME", c_in, params=[site])
+                    df_flowmeta = pd.read_sql("SELECT SH, RS, RP, LANE, TYPE, REGION, SITETYPE, LAT, LON FROM flow_meta WHERE SITEREF = ?", c_in, params=[site])
+                    df_flowmeta[['DATETIME_MIN','DATETIME_MAX']] = pd.DataFrame({
+                        'DATETIME_MIN': [df['DATETIME'].min()],
+                        'DATETIME_MAX': [df['DATETIME'].max()]
+                    })
+                    df_flowmeta = df_flowmeta.assign(SITEREF=site)
 
-                    if True:
+                    if not df_flowmeta.shape[0] == 1:
+                        print( "ERROR SHAPE" )
+                        break
+                    df = df.assign(SITEREF=site, REGION=reg, LON=lon, LAT=lat, DATETIME=pd.to_datetime(df['DATETIME']).dt.floor('h'))
+                    df = df.groupby(['SITEREF', 'FLOW' , 'WEIGHT','DIRECTION', 'REGION', 'DATETIME', 'LON', 'LAT'], as_index=False).agg(FLOW=('FLOW', 'sum'))
+                    try:
+                        df['DATETIME_NZ'] = df['DATETIME'].dt.tz_localize('Pacific/Auckland', ambiguous=False, nonexistent='shift_forward')
+                    except Exception as e:
+                        print(e, "Erreur detection changement d'horaire")
 
-                        bounds_query = "SELECT MIN(DATETIME) as min_dt, MAX(DATETIME) as max_dt FROM flow WHERE SITEREF = ? AND DATETIME >= '2013-01-02'"
-                        bounds = pd.read_sql(bounds_query, conn, params=[station])
+                    df['t_utc'] = df['DATETIME_NZ'].dt.tz_convert('UTC').dt.tz_localize(None).astype('datetime64[s]')
+                    _, idx = tree.query(df[['LON', 'LAT']].values)
 
-                        if bounds.empty or pd.isna(bounds['min_dt'].iloc[0]):
-                            continue
+                    df['ELON'] = grid[idx, 0]
+                    df['ELAT'] = grid[idx, 1]
 
-                        current_start = pd.to_datetime(bounds['min_dt'].iloc[0])
-                        final_end = pd.to_datetime(bounds['max_dt'].iloc[0])
-                        chunk_idx = 0
+                    u_t = df['t_utc'].dt.strftime('%Y-%m-%d %H:%M:%S').unique().tolist()
+                    u_lon = df['ELON'].unique().tolist()
+                    u_lat = df['ELAT'].unique().tolist()
+                    w_prm = u_t + u_lon + u_lat
 
-                        if True:
-                       # while True: #current_start <= final_end:
-                            if stop_event.is_set():
-                                break
+                    q_w = f"SELECT * FROM weather_data WHERE time IN ({','.join(['?']*len(u_t))}) AND longitude IN ({','.join(['?']*len(u_lon))}) AND latitude IN ({','.join(['?']*len(u_lat))})"
+                    df_w = pd.read_sql(q_w, c_era, params=w_prm)
 
-                           # current_end = current_start + pd.DateOffset(months=48)
+                    attendu = len(u_t) * len(u_lon) * len(u_lat)
+                    if len(df_w) != attendu:
+                        print(f"Err df_w: {len(df_w)}/{attendu} (Reg: {reg})")
 
-                            query = """
-                                    SELECT * FROM flow
-                                    WHERE SITEREF = ?
-                                    ORDER BY DATETIME 
-                                    """
-                #       AND DATETIME >= ?
-                #        AND DATETIME < ?
+                    df_w['time'] = pd.to_datetime(df_w['time']).astype('datetime64[s]')
+                    df_w[['longitude', 'latitude']] = df_w[['longitude', 'latitude']].astype(float)
 
-                            chunk = pd.read_sql(
-                                query,
-                                conn,
-                                params=[
-                                    station,
-                                   # current_start.strftime('%Y-%m-%d %H:%M:%S'),
-                                   # current_end.strftime('%Y-%m-%d %H:%M:%S')
-                                ]
-                            )
+                    df = df.merge(df_w, left_on=['ELON', 'ELAT', 't_utc'], right_on=['longitude', 'latitude', 'time'], how='left')
+                    df = df.drop(columns=[c for c in ['longitude', 'latitude', 'time', 'time_nz_flow'] if c in df.columns])
 
-                        #    if chunk.empty:
-                        #        current_start = current_end
-                        #        continue
+                    df = get_hol(df, df_h, reg)
+                    df = get_xtw(df, df_x, reg)
 
-                            chunk['SITEREF'] = station
-                            chunk['LON'] = lon
-                            chunk['LAT'] = lat
-                           # chunk['DATETIME'] = pd.to_datetime(chunk['DATETIME'])
-                            chunk['DATETIME'] = pd.to_datetime(chunk['DATETIME']).dt.floor('h')
+                    q_out.put({
+                        'w_id': w_id,
+                        'reg': reg,
+                        'df': df,
+                        'df_meta' : df_flowmeta,
+                    })
 
-                          #  print(chunk)
-
-                            try:
-                                chunk['DATETIME_NZ'] = (
-                                    chunk['DATETIME']
-                                    .dt.tz_localize('Pacific/Auckland', ambiguous=False, nonexistent='shift_forward')
-                                )
-                            except Exception as e:
-                                print(e)
-                                print(chunk['DATETIME'])
-
-                            chunk['time_in_utc'] = chunk['DATETIME_NZ'].dt.tz_convert('UTC').dt.tz_localize(None).astype('datetime64[s]')
-
-                            points_trafic = chunk[['LON', 'LAT']].values
-                            _, indices = tree.query(points_trafic)
-
-                            chunk['era5_lon'] = grid_coords[indices, 0].round(2)
-                            chunk['era5_lat'] = grid_coords[indices, 1].round(2)
-
-                            u_lons = chunk['era5_lon'].unique().tolist()
-                            u_lats = chunk['era5_lat'].unique().tolist()
-                            u_times = chunk['time_in_utc'].dt.strftime('%Y-%m-%d %H:%M:%S').unique().tolist()
-
-                            query_weather = f"""
-                                SELECT * FROM weather_data
-                                WHERE time IN ({','.join(['?']*len(u_times))})
-                                AND longitude IN ({','.join(['?']*len(u_lons))})
-                                AND latitude IN ({','.join(['?']*len(u_lats))})
-                            """
-
-                            weather_params = u_times + u_lons + u_lats
-                            weather_df = pd.read_sql(query_weather, conn_era5, params=weather_params)
-                            print("res weather : " , len(weather_df) -  len( weather_params ), len(weather_df))
-                            if not weather_df.empty:
-                                weather_df['time'] = pd.to_datetime(weather_df['time']).astype('datetime64[s]')
-                                weather_df['longitude'] = weather_df['longitude'].astype(float).round(2)
-                                weather_df['latitude'] = weather_df['latitude'].astype(float).round(2)
-
-                                chunk = chunk.merge(
-                                    weather_df,
-                                    left_on=['era5_lon', 'era5_lat', 'time_in_utc'],
-                                    right_on=['longitude', 'latitude', 'time'],
-                                    how='left'
-                                )
-
-
-                                drop_cols = [c for c in ['longitude', 'latitude', 'time', 'time_nz_flow'] if c in chunk.columns]
-                                chunk = chunk.drop(columns=drop_cols)
-                            else:
-                                print(f"[Worker {worker_id}] No weather data for chunk {chunk_idx} in {region}")
-
-                            chunk = get_holiday_data(chunk, df_holiday, region)
-                            chunk = get_xtw_data(chunk, df_xtw, region)
-
-                            output_queue.put({
-                                'worker_id': worker_id,
-                                'region': region,
-                                'chunk_idx': chunk_idx,
-                                'data': chunk,
-                            })
-
-                            progress_dict['total_chunks_produced'] += 1
-                            progress_dict[f'producer_{worker_id}_chunks'] = progress_dict.get(f'producer_{worker_id}_chunks', 0) + 1
-
-                            chunk_idx += 1
-                          #  current_start = current_end
+                    prog['t_prod'] += 1
+                    prog[f'p_{w_id}_c'] = prog.get(f'p_{w_id}_c', 0) + 1
 
                 except Exception as e:
-                    print(f"[Producer {worker_id}] Error in region {region}: {e}")
+                    print(f"[{w_id}] Err {reg}: {e} ERR2")
 
-                progress_dict['total_tasks_done'] = progress_dict.get('total_tasks_done', 0) + 1
+                prog['t_done'] = prog.get('t_done', 0) + 1
 
         except Exception as e:
-            print(f"[Producer {worker_id}] Critical Error: {e}")
-
-CATALOG = {
-    'SITEREF': {}, 'REGION': {}, 'DIRECTION': {},
-    'TYPE': {}, 'HAZARD': {}, 'WEIGHT': {}
-}
-
-def ensure_catalog_table(conn):
-    conn.execute("""
-                 CREATE TABLE IF NOT EXISTS catalog (
-                                                        col TEXT NOT NULL,
-                                                        code INTEGER NOT NULL,
-                                                        label TEXT NOT NULL,
-                                                        PRIMARY KEY (col, code)
-                     )
-                 """)
-    conn.commit()
-
-def load_catalog_from_db(conn):
-    """Charge le catalog existant depuis SQLite au démarrage."""
-    try:
-        rows = conn.execute("SELECT col, code, label FROM catalog").fetchall()
-        for col, code, label in rows:
-            if col in CATALOG:
-                CATALOG[col][label] = code
-        print(f"[Catalog] Chargé : { {k: len(v) for k, v in CATALOG.items()} }")
-    except Exception as e:
-        print(f"[Catalog] Rien à charger : {e}")
-
-def encode_with_catalog(conn, chunk, col):
-    existing = CATALOG[col]
-    unique_vals = chunk[col].fillna('').astype(str).unique()
-
-    new_entries = []
-    for val in unique_vals:
-        if val not in existing:
-            new_code = len(existing)
-            existing[val] = new_code
-            new_entries.append((col, new_code, val))
-
-    if new_entries:
-        conn.executemany(
-            "INSERT OR IGNORE INTO catalog (col, code, label) VALUES (?, ?, ?)",
-            new_entries
-        )
-        conn.commit()  # persisté immédiatement
-
-    chunk[col] = chunk[col].fillna('').astype(str).map(existing).astype('int32')
-    return chunk
-
-MAP_PATH = Path("./nz/data/processed/text_map.json")
-
-# Structure : { "IMPACT": {"texte...": 0, ...}, "ABSTRACT": {...}, ... }
-TEXT_COLS = ['IMPACT', 'ABSTRACT', 'IDENTIFIER', 'HOLIDAY']
-
-def load_text_map():
-    if MAP_PATH.exists():
-        return json.loads(MAP_PATH.read_text())
-    return {col: {} for col in TEXT_COLS}
-
-def save_text_map(text_map):
-    MAP_PATH.write_text(json.dumps(text_map, ensure_ascii=False, indent=2))
-
-def encode_text_cols(chunk, text_map):
-    changed = False
-    for col in TEXT_COLS:
-        mapping = text_map[col]
-        for val in chunk[col].fillna('').astype(str).unique():
-            if val not in mapping:
-                mapping[val] = len(mapping)
-                changed = True
-        chunk[col] = chunk[col].fillna('').astype(str).map(mapping).astype('int32')
-    return chunk, changed
+            print(f"[{w_id}] Crit: {e}")
 
 
-def mount_consumer(consumer_id, input_queue, stop_event, process_func, progress_dict):
-    text_map = load_text_map()
+def mount_consumer(c_id, q_in, stop, func, prog):
+    e_cols = ['WEIGHT','HAZARD','IDENTIFIER','ABSTRACT','IMPACT']
+        #['SITEREF', 'REGION', 'HAZARD', 'IMPACT', 'ABSTRACT', 'IDENTIFIER', 'HOLIDAY', 'TYPE']
 
-    with sqlite3.connect("./nz/data/processed/db.db") as conn:
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA synchronous=OFF;")
+    with sqlite3.connect("./nz/data/processed/db.db") as c:
+        c.execute("PRAGMA journal_mode=WAL;")
+        c.execute("PRAGMA synchronous=OFF;")
+        init_db(c)
 
-        while not stop_event.is_set():
+        while not stop.is_set():
             try:
-                item = input_queue.get(timeout=5)
+                item = q_in.get(timeout=5)
                 if item is None:
+                    print("None item")
                     break
 
-                chunk = item['data']
+                df = item['df']
 
-                for col in ['SITEREF', 'REGION', 'DIRECTION', 'TYPE', 'HAZARD', 'WEIGHT']:
-                    chunk[col] = chunk[col].astype('category')
+               # for col in ['DATETIME', 'START_DATE', 'STOP_DATE']:
+               #     if col in df.columns:
+               #         df[col] = pd.to_datetime(df[col]).dt.strftime('%Y-%m-%d %H:%M:%S')
 
-                for col in ['DATETIME', 'START_DATE', 'STOP_DATE']:
-                    chunk[col] = pd.to_datetime(chunk[col]).dt.strftime('%Y-%m-%d %H:%M:%S')
 
-                chunk['is_holiday'] = chunk['is_holiday'].fillna(0).astype('int8')
-                chunk['FLOW'] = pd.to_numeric(chunk['FLOW'], downcast='integer')
+                df_flowmeta = item['df_meta']
+                upd_site(c, df_flowmeta)
 
-                for col in ['LON', 'LAT', 'u10', 'v10', 't2m', 'd2m', 'msl', 'ssrd', 'hours_since_xtw']:
-                    chunk[col] = pd.to_numeric(chunk[col], downcast='float')
+                df['IS_HOLIDAY'] = df['IS_HOLIDAY'].astype('int8')
+                df['H_SINCE_XTW'] = df['H_SINCE_XTW'].astype('int16')
+                df['FLOW'] = pd.to_numeric(df['FLOW'], downcast='integer')
 
-                chunk['tcc'] = (pd.to_numeric(chunk['tcc'], errors='coerce').fillna(0) * 100).round(0).astype('int8')
-                for col in ['tp', 'cp']:
-                    chunk[col] = (pd.to_numeric(chunk[col], errors='coerce').fillna(0) * 10_000).round(0).astype('int16')
+                #Map
+                df = enc_db(c, df, e_cols)
 
-                # Textes longs → int32 + map JSON
-                chunk, changed = encode_text_cols(chunk, text_map)
-                if changed:
-                    save_text_map(text_map)
+                for col in e_cols:
+                    df[col] = df[col].astype('int32')
 
-                chunk = chunk[[
-                    'ID', 'SITEREF', 'DATETIME', 'FLOW', 'WEIGHT', 'DIRECTION', 'LON', 'LAT',
+                meteo_cols = ['msl', 'tcc', 'u10', 'v10', 't2m', 'd2m', 'tp', 'cp', 'ssrd']
+                df[meteo_cols] = df[meteo_cols].astype('float32')
+
+                df[['LON', 'LAT', 'ELON', 'ELAT']] = df[['LON', 'LAT', 'ELON', 'ELAT']].astype('float32')
+
+                keep = [
+                    'DATETIME', 'REGION', 'SITEREF', 'LON', 'LAT', 'ELON', 'ELAT',
+                    'FLOW', 'WEIGHT', 'DIRECTION',
                     'msl', 'tcc', 'u10', 'v10', 't2m', 'd2m', 'tp', 'cp', 'ssrd',
-                    'HOLIDAY', 'TYPE', 'START_DATE', 'STOP_DATE', 'REGION',
-                    'is_holiday', 'HAZARD', 'IDENTIFIER', 'ABSTRACT', 'IMPACT', 'hours_since_xtw'
-                ]]
+                    'IS_HOLIDAY',
+                    'HAZARD', 'IDENTIFIER', 'ABSTRACT', 'IMPACT', 'H_SINCE_XTW'
+                ]
 
-                chunk.to_sql('data', conn, if_exists='append', index=False, method='multi', chunksize=500)
+                df = df[keep]
 
-                progress_dict['total_chunks_processed'] += 1
+                df[keep].to_sql('data', c, if_exists='append', index=False, method='multi', chunksize=5000)
+
+                prog['t_proc'] += 1
 
             except Empty:
+                print("None item*")
                 continue
 
+def prog_mon(prog, stop, n_p, n_c, tot):
+    pb = tqdm(total=tot, desc="PROG", dynamic_ncols=True)
 
+    while not stop.is_set():
+        done = prog.get('t_done', 0)
+        prod = prog.get('t_prod', 0)
+        proc = prog.get('t_proc', 0)
 
-                #reverse = {v: k for k, v in text_map['IMPACT'].items()}
-
-
-def progress_monitor(progress_dict, stop_event, n_producers, n_consumers, total_tasks):
-
-    pbar = tqdm(total=total_tasks, desc="GLOBAL PROGRESS", dynamic_ncols=True)
-
-    while not stop_event.is_set():
-        tasks_done = progress_dict.get('total_tasks_done', 0)
-        produced = progress_dict.get('total_chunks_produced', 0)
-        processed = progress_dict.get('total_chunks_processed', 0)
-
-        pbar.n = tasks_done
-
-        pbar.set_description(f"Tasks: {tasks_done}/{total_tasks} | Stock: {produced-processed} | Total Chunks: {processed}")
-
-        pbar.refresh()
+        pb.n = done
+        pb.set_description(f"T: {done}/{tot} | S: {prod-proc} | C: {proc}")
+        pb.refresh()
         time.sleep(0.5)
 
-    pbar.close()
+    pb.close()
