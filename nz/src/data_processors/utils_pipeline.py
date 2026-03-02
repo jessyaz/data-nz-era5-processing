@@ -1,5 +1,5 @@
 import sqlite3
-from logging.config import IDENTIFIER
+#from logging.config import IDENTIFIER
 
 import pandas as pd
 import time
